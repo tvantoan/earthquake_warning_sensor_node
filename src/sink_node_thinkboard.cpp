@@ -1,243 +1,357 @@
-/*
- * ESP-NOW SINK NODE - Kết nối ThingsBoard qua MQTT
- *
- * Chức năng:
- * 1. Nhận dữ liệu từ Edge Node qua ESP-NOW
- * 2. Gửi trực tiếp lên ThingsBoard qua MQTT
- *
- * Flow: Edge Node → ESP-NOW → Sink Node → ThingsBoard MQTT
- */
-
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-// --- Cấu hình Wi-Fi ---
-const char *ssid = "Tiendeptry";
-const char *password = "123456789";
+const char *ssid = "Tầng5";
+const char *password = "ANH12345678";
 
-// --- Cấu hình MQTT ThingsBoard ---
-const char *mqtt_server = "mqtt.eu.thingsboard.cloud"; // Tên server ThingsBoard (có thể là IP hoặc domain)
-const int mqtt_port = 1883;                            // Port MQTT (thường là 1883, hoặc 8883 cho SSL)
-const char *access_token = "RJJMZau9ejd5FwzC9qhO";     // Access Token từ ThingsBoard Device
-const char *mqtt_topic = "v1/devices/me/telemetry";    // Topic để publish telemetry lên ThingsBoard
+const char *mqtt_server = "mqtt.eu.thingsboard.cloud";
+const int mqtt_port = 1883;
+const char *access_token = "RJJMZau9ejd5FwzC9qhO";
+const char *mqtt_topic = "v1/devices/me/telemetry";
+
+#define NUM_EDGE_NODES 2
+
+uint8_t edgeMacs[NUM_EDGE_NODES][6] = {
+    {0x48, 0xE7, 0x29, 0xB4, 0x80, 0xCC},
+    {0x6C, 0xC8, 0x40, 0x8B, 0x43, 0x08}};
+
+const char *EXPECTED_NODES[NUM_EDGE_NODES] = {
+    "ADXL_EDGE",
+    "MPU_EDGE"};
+
+#define WIFI_CHANNEL_LOCK 1
+#define LOW_THRESHOLD 0.001185f
+#define MEDIUM_THRESHOLD 0.125888f
+#define HIGH_THRESHOLD 0.250591f
+#define RUN_NOW_THRESHOLD 0.5f
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// ĐỊNH NGHĨA STRUCT (Phải giống hệt bên Node Thu Thập)
-typedef struct struct_message
+typedef struct
 {
-    char node_id[10]; // ID của Edge Node (ví dụ: "EDGE_01", "EDGE_02")
-    float rms_value;
-    float out_real;
+    char node_id[10];
+    float computed_rms;
+    float predicted_rms;
     float error;
 } struct_message;
 
 struct_message myData;
+struct_message dataNode[NUM_EDGE_NODES];
+bool nodeReceived[NUM_EDGE_NODES] = {false, false};
+void send_to_thingsboard(String vibrationLevel, float meanError);
+void reconnect_mqtt();
+String classifyVibrationLevel(float error);
 
-// --- Hàm kết nối Wi-Fi ---
+void printMac(const uint8_t *mac)
+{
+    char s[18];
+    sprintf(s, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.print(s);
+}
+
+String classifyVibrationLevel(float error)
+{
+    if (error < 0.00118562f)
+        return "NONE_SHAKING";
+    else if (error < 0.25f)
+        return "MICRO_SHAKING";
+    else if (error < 0.45f)
+        return "MINOR_SHAKING";
+    else if (error < 0.95f)
+        return "LIGHT_SHAKING";
+    else if (error < 2.3f)
+        return "MODERATE_SHAKING";
+    else
+        return "SEVERE_SHAKING";
+}
+
+bool isValidEdgeNode(const uint8_t *mac)
+{
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    {
+        if (memcmp(mac, edgeMacs[i], 6) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isValidNodeId(const char *node_id)
+{
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    {
+        if (strcmp(node_id, EXPECTED_NODES[i]) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
+{
+    memcpy(&myData, data, sizeof(myData));
+
+    int nodeIndex = -1;
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    {
+        if (strcmp(myData.node_id, EXPECTED_NODES[i]) == 0)
+        {
+            nodeIndex = i;
+            break;
+        }
+    }
+
+    if (nodeIndex == -1)
+    {
+        Serial.println("⚠ Unknown node ID, skipping");
+        return;
+    }
+
+    dataNode[nodeIndex] = myData;
+    nodeReceived[nodeIndex] = true;
+
+    Serial.printf("Node %s received and stored!\n", myData.node_id);
+
+    bool allOK = true;
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    {
+        if (!nodeReceived[i])
+            allOK = false;
+    }
+
+    if (allOK)
+    {
+        Serial.println("Received ALL NODES → Processing…");
+        float meanError = 0.0;
+        for (int i = 0; i < NUM_EDGE_NODES; i++)
+        {
+            if (strcmp(dataNode[i].node_id, "MPU_EDGE") == 0)
+            {
+                continue;
+            }
+
+            meanError += dataNode[i].error;
+        }
+        // meanError /= NUM_EDGE_NODES;
+
+        String vibrationLevel = classifyVibrationLevel(meanError);
+        send_to_thingsboard(vibrationLevel, meanError);
+    }
+}
+
+void addPeers()
+{
+    Serial.println("\n[Peer] Adding 2 peers with assigned MAC addresses…");
+
+    esp_now_peer_info_t peer1{};
+    memcpy(peer1.peer_addr, edgeMacs[0], 6);
+    peer1.channel = WIFI_CHANNEL_LOCK;
+    peer1.encrypt = false;
+
+    Serial.print("  Peer 1 MAC: ");
+    printMac(edgeMacs[0]);
+    Serial.printf(" Channel: %d\n", peer1.channel);
+
+    esp_err_t st1 = esp_now_add_peer(&peer1);
+    if (st1 == ESP_OK)
+    {
+        Serial.println("     Peer 1 added");
+    }
+    else if (st1 == ESP_ERR_ESPNOW_EXIST)
+    {
+        Serial.println("     Peer 1 already existed");
+    }
+    else
+    {
+        Serial.print("     Peer 1 add failed: ");
+        Serial.println(st1);
+    }
+
+    esp_now_peer_info_t peer2{};
+    memcpy(peer2.peer_addr, edgeMacs[1], 6);
+    peer2.channel = WIFI_CHANNEL_LOCK;
+    peer2.encrypt = false;
+
+    Serial.print("  Peer 2 MAC: ");
+    printMac(edgeMacs[1]);
+    Serial.printf(" Channel: %d\n", peer2.channel);
+
+    esp_err_t st2 = esp_now_add_peer(&peer2);
+    if (st2 == ESP_OK)
+    {
+        Serial.println("     Peer 2 added");
+    }
+    else if (st2 == ESP_ERR_ESPNOW_EXIST)
+    {
+        Serial.println("    Peer 2 already existed");
+    }
+    else
+    {
+        Serial.print("     Peer 2 add failed: ");
+        Serial.println(st2);
+    }
+}
+
 void setup_wifi()
 {
     delay(10);
-    Serial.print("Connecting to ");
+    Serial.println("\n===== SINK NODE START =====");
+
+    WiFi.mode(WIFI_STA);
+
+    Serial.print("[WiFi] This ESP MAC: ");
+    Serial.println(WiFi.macAddress());
+
+    Serial.print("[WiFi] Connecting to: ");
     Serial.println(ssid);
-    WiFi.mode(WIFI_STA); // Cần cho ESP-NOW
+    WiFi.disconnect(true);
+    delay(100);
+
+    WiFi.mode(WIFI_STA);
+    // WiFi.config(
+    //     IPAddress(192, 168, 0, 149),
+    //     IPAddress(192, 168, 0, 1),
+    //     IPAddress(255, 255, 255, 0),
+    //     IPAddress(8, 8, 8, 8));
     WiFi.begin(ssid, password);
 
     int attempts = 0;
-    const int maxAttempts = 20; // Timeout sau 10 giây
-    while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts)
+    while (WiFi.status() != WL_CONNECTED && attempts < 30)
     {
         delay(500);
         Serial.print(".");
         attempts++;
     }
 
-    if (WiFi.status() != WL_CONNECTED)
+    if (WiFi.status() == WL_CONNECTED)
     {
-        Serial.println("\nFailed to connect to WiFi!");
-        return;
+        Serial.println("\n[WiFi] Connected!");
+        Serial.print("[WiFi] IP address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("[WiFi] Channel: ");
+        Serial.println(WiFi.channel());
+        Serial.println(WiFi.localIP());
+        Serial.println(WiFi.gatewayIP());
+        Serial.println(WiFi.dnsIP());
+    }
+    else
+    {
+        Serial.println("\n[WiFi] Connection failed!");
+        Serial.print("[WiFi] Status: ");
+        Serial.println(WiFi.status());
+        Serial.println("[WiFi] ESP-NOW will still work, but MQTT won't");
     }
 
-    Serial.println("\nWiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("MAC address: ");
-    Serial.println(WiFi.macAddress());
-    Serial.printf("WiFi Channel: %d\n", WiFi.channel());
+    int channel = WiFi.channel();
+
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    Serial.print("[WiFi] Channel locked to: ");
+    Serial.println(channel);
+
+    Serial.print("[ESPNOW] Initializing… ");
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println("❌ FAIL");
+        while (1)
+            delay(1000);
+    }
+    Serial.println("OK");
+
+    esp_now_register_recv_cb(onDataRecv);
+
+    addPeers();
+    Serial.println("===== Sink ready. Waiting for packets from 2 Edge Nodes… =====");
 }
 
-// --- Hàm kết nối lại MQTT ---
 void reconnect_mqtt()
 {
+    IPAddress testIP;
+    if (!WiFi.hostByName("mqtt.eu.thingsboard.cloud", testIP))
+    {
+        Serial.println("DNS FAIL - cannot resolve hostname!");
+    }
+    else
+    {
+        Serial.print("Resolved: ");
+        Serial.println(testIP);
+    }
+
     while (!client.connected())
     {
-        Serial.print("Attempting MQTT connection...");
-        String clientId = "ESP32-SinkNode-";
+        Serial.print("Attempt MQTT connect...");
+        String clientId = "ESP32-Sink-";
         clientId += String(random(0xffff), HEX);
-
-        // Kết nối với ThingsBoard: dùng Access Token làm username, password để trống
         if (client.connect(clientId.c_str(), access_token, NULL))
         {
-            Serial.println("connected");
+            Serial.println("MQTT connected");
         }
         else
         {
-            Serial.print("failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" try again in 5 seconds");
+            Serial.print("MQTT fail rc=");
+            Serial.println(client.state());
             delay(5000);
         }
     }
 }
 
-// --- Hàm gửi dữ liệu lên ThingsBoard qua MQTT ---
-void send_to_thinkboard()
+void send_to_thingsboard(String vibrationLevel, float meanError)
 {
     if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.println("WiFi not connected. Cannot send to ThingsBoard.");
+        Serial.println("WiFi not connected. Skip send");
         return;
     }
-
-    // Kiểm tra kết nối MQTT trước khi publish
     if (!client.connected())
-    {
-        Serial.println("MQTT not connected. Attempting reconnect...");
         reconnect_mqtt();
-    }
-
-    // Tạo JSON payload cho ThingsBoard
-    JsonDocument doc;
-
-    // Thêm dữ liệu từ sensor
-    doc["node_id"] = String(myData.node_id);
-    doc["rms"] = myData.rms_value;
-    doc["out_real"] = myData.out_real;
-    doc["error"] = myData.error;
-
-    // Thêm timestamp
+    StaticJsonDocument<256> doc;
+    doc["node_id"] = "SINK_NODE";
+    doc["mean_error"] = meanError;
+    doc["vibration_level"] = vibrationLevel;
     doc["timestamp"] = millis();
-
-    // Serialize JSON
-    String jsonPayload;
-    serializeJson(doc, jsonPayload);
-
-    // In payload để debug
-    Serial.println("=== Sending to ThingsBoard ===");
-    Serial.println("JSON Payload:");
-    Serial.println(jsonPayload);
-
-    // Publish (gửi) chuỗi JSON lên ThingsBoard qua MQTT
-    if (client.connected())
+    String payload;
+    serializeJson(doc, payload);
+    Serial.println("Publish payload:");
+    Serial.println(payload);
+    if (client.publish(mqtt_topic, payload.c_str()))
     {
-        bool published = client.publish(mqtt_topic, jsonPayload.c_str());
-        if (published)
-        {
-            Serial.print("Published to ThingsBoard MQTT: ");
-            Serial.println(jsonPayload);
-            Serial.println("Data sent successfully to ThingsBoard!");
-        }
-        else
-        {
-            Serial.println("Failed to publish to ThingsBoard MQTT");
-        }
+        Serial.println("Published OK");
     }
     else
     {
-        Serial.println("Cannot publish: MQTT not connected");
+        Serial.println("Publish FAIL");
     }
-
-    Serial.println("==================================\n");
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+        nodeReceived[i] = false;
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+        memset(&dataNode[i], 0, sizeof(struct_message));
 }
 
-// --- HÀM QUAN TRỌNG: Được gọi khi nhận dữ liệu ESP-NOW ---
-// Call back function : tự động gọi mỗi khi có một gói tin mới từ Node Cảm biến gửi đến.
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-    // 1. Kiểm tra độ dài dữ liệu
-    if (len != sizeof(struct_message))
-    {
-        Serial.printf("Error: Data length mismatch. Expected %d, got %d\n", sizeof(struct_message), len);
-        return;
-    }
-
-    // 2. Sao chép dữ liệu nhận được vào struct
-    memcpy(&myData, incomingData, sizeof(myData));
-
-    // 3. In MAC address của Edge Node gửi đến
-    char macStr[18];
-    sprintf(macStr, "%02x:%02x:%02x:%02x:%02x:%02x",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    Serial.print("Data received from: ");
-    Serial.println(macStr);
-
-    // 4. In ra Serial để kiểm tra
-    Serial.print("  Node ID: ");
-    Serial.print(myData.node_id);
-    Serial.print(", RMS: ");
-    Serial.print(myData.rms_value, 6); // In 6 chữ số sau dấu phẩy
-    Serial.print(", out_real: ");
-    Serial.print(myData.out_real);
-    Serial.printf("error", myData.error);
-    // 5. Gửi dữ liệu lên ThingsBoard qua MQTT
-    send_to_thinkboard();
-}
-
-// --- HÀM SETUP ---
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    delay(200);
+    Serial.println("Sink Node starting");
 
-    Serial.println("========================================");
-    Serial.println("ESP-NOW Sink Node - ThingsBoard MQTT");
-    Serial.println("========================================");
-
-    // 1. Kết nối Wi-Fi (cần cho MQTT)
     setup_wifi();
 
-    // 2. Cấu hình MQTT
     client.setServer(mqtt_server, mqtt_port);
 
-    // 3. Khởi tạo ESP-NOW (ở chế độ STA)
-    // WiFi.mode(WIFI_STA) đã được gọi trong setup_wifi()
-    if (esp_now_init() != ESP_OK)
-    {
-        Serial.println("Error initializing ESP-NOW");
-        return;
-    }
-
-    // 4. Đăng ký hàm callback để "nhận" dữ liệu
-    esp_now_register_recv_cb(OnDataRecv);
-
-    // 5. Kết nối MQTT lần đầu
     reconnect_mqtt();
 
-    Serial.println("========================================");
-    Serial.println("ESP-NOW Sink Node ready to receive data");
-    Serial.print("MQTT Server: ");
-    Serial.println(mqtt_server);
-    Serial.print("MQTT Topic: ");
-    Serial.println(mqtt_topic);
-    Serial.println("========================================");
+    Serial.println("Sink ready. Waiting for incoming ESP-NOW packets");
 }
 
-// --- HÀM LOOP ---
 void loop()
 {
-    // 1. Kiểm tra kết nối MQTT, nếu mất thì kết nối lại
     if (!client.connected())
-    {
         reconnect_mqtt();
-    }
-
-    // 2. Duy trì kết nối MQTT
     client.loop();
-
-    // Không cần làm gì khác, hàm OnDataRecv() sẽ tự động chạy
-    // khi có dữ liệu mới từ Node Thu Thập và gửi lên ThingsBoard.
-    delay(10); // Thêm delay nhỏ để hệ thống ổn định
+    delay(10);
 }
