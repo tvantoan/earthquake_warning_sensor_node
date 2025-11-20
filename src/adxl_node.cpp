@@ -23,6 +23,7 @@ typedef struct
   float computed_rms;
   float predicted_rms;
   float error;
+  char vibration_level[20];
 } struct_message;
 
 struct_message myData;
@@ -51,6 +52,23 @@ uint8_t tensor_arena[8 * 1024];
 tflite::MicroInterpreter *interpreter;
 TfLiteTensor *input;
 TfLiteTensor *output;
+
+String classifyVibrationLevel(float error)
+{
+  if (error < 0.00118562f)
+    return "NONE_SHAKING";
+  else if (error < 0.25f)
+    return "MICRO_SHAKING";
+  else if (error < 0.45f)
+    return "MINOR_SHAKING";
+  else if (error < 0.95f)
+    return "LIGHT_SHAKING";
+  else if (error < 2.3f)
+    return "MODERATE_SHAKING";
+  else
+    return "SEVERE_SHAKING";
+}
+
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
   Serial.print("onDataSent -> status: ");
@@ -98,9 +116,11 @@ void feedModel(float currentRms)
   myData.computed_rms = currentRms;
   myData.predicted_rms = out_real;
   myData.error = error;
+  strcpy(myData.vibration_level, classifyVibrationLevel(error).c_str());
 
   Serial.printf("RMS=%.6f | Pred=%.6f | Err=%.6f\n", currentRms, out_real, error);
-
+  Serial.print("Vibration Level: ");
+  Serial.println(myData.vibration_level);
   esp_err_t result = esp_now_send(sinkMac, (uint8_t *)&myData, sizeof(myData));
   Serial.print("esp_now_send result: ");
   Serial.println(result);
@@ -138,6 +158,8 @@ void setup()
       delay(1000);
   }
   int channel = WiFi.channel();
+  Serial.print("WiFi connected on channel ");
+  Serial.println(channel);
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
   esp_now_register_send_cb(onDataSent);
   addPeer(channel);
@@ -196,7 +218,7 @@ void loop()
     batchCount = 0;
     float rms = sqrt(sumDynSq / dynCnt);
     rmsBuf[rmsIdx] = rms;
-
+    // Serial.println(rms, 6);
     if (rmsCnt < RMS_WINDOW_SIZE)
       rmsCnt++;
     rmsIdx = (rmsIdx + 1) % RMS_WINDOW_SIZE;

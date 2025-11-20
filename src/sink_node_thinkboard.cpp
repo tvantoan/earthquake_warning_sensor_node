@@ -4,6 +4,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
+// ===== WiFi & MQTT config =====
 const char *ssid = "Tầng5";
 const char *password = "ANH12345678";
 
@@ -12,8 +13,8 @@ const int mqtt_port = 1883;
 const char *access_token = "RJJMZau9ejd5FwzC9qhO";
 const char *mqtt_topic = "v1/devices/me/telemetry";
 
+// ===== Edge nodes =====
 #define NUM_EDGE_NODES 2
-
 uint8_t edgeMacs[NUM_EDGE_NODES][6] = {
     {0x48, 0xE7, 0x29, 0xB4, 0x80, 0xCC},
     {0x6C, 0xC8, 0x40, 0x8B, 0x43, 0x08}};
@@ -22,30 +23,24 @@ const char *EXPECTED_NODES[NUM_EDGE_NODES] = {
     "ADXL_EDGE",
     "MPU_EDGE"};
 
-#define WIFI_CHANNEL_LOCK 1
-#define LOW_THRESHOLD 0.001185f
-#define MEDIUM_THRESHOLD 0.125888f
-#define HIGH_THRESHOLD 0.250591f
-#define RUN_NOW_THRESHOLD 0.5f
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
+// ===== Data struct =====
 typedef struct
 {
     char node_id[10];
     float computed_rms;
     float predicted_rms;
     float error;
+    char vibration_level[20];
 } struct_message;
 
-struct_message myData;
 struct_message dataNode[NUM_EDGE_NODES];
-bool nodeReceived[NUM_EDGE_NODES] = {false, false};
-void send_to_thingsboard(String vibrationLevel, float meanError);
-void reconnect_mqtt();
-String classifyVibrationLevel(float error);
+bool nodeReceived[NUM_EDGE_NODES] = {false};
+struct_message myData;
 
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ===== Helpers =====
 void printMac(const uint8_t *mac)
 {
     char s[18];
@@ -54,173 +49,144 @@ void printMac(const uint8_t *mac)
     Serial.print(s);
 }
 
-String classifyVibrationLevel(float error)
+int findNodeIndex(const char *id)
 {
-    if (error < 0.00118562f)
-        return "NONE_SHAKING";
-    else if (error < 0.25f)
-        return "MICRO_SHAKING";
-    else if (error < 0.45f)
-        return "MINOR_SHAKING";
-    else if (error < 0.95f)
-        return "LIGHT_SHAKING";
-    else if (error < 2.3f)
-        return "MODERATE_SHAKING";
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+        if (strcmp(id, EXPECTED_NODES[i]) == 0)
+            return i;
+    return -1;
+}
+
+int compareVibrationLevel(const String &level1, const String &level2)
+{
+    const char *order[] = {"NONE_SHAKING", "MICRO_SHAKING", "MINOR_SHAKING", "LIGHT_SHAKING", "MODERATE_SHAKING", "SEVERE_SHAKING"};
+    int idx1 = 0, idx2 = 0;
+    for (int i = 0; i < 6; i++)
+    {
+        if (level1 == order[i])
+            idx1 = i;
+        if (level2 == order[i])
+            idx2 = i;
+    }
+    return (idx1 < idx2) ? -1 : (idx1 > idx2) ? 1
+                                              : 0;
+}
+
+// Chọn nhãn cao nhất từ tất cả node
+String getHighestVibrationLevel()
+{
+    String highest = dataNode[0].vibration_level;
+    for (int i = 1; i < NUM_EDGE_NODES; i++)
+    {
+        if (compareVibrationLevel(dataNode[i].vibration_level, highest) > 0)
+            highest = dataNode[i].vibration_level;
+    }
+    return highest;
+}
+// ===== Publish full packet =====
+void publishAllNodes(String highestLevel)
+{
+    if (!client.connected())
+        return;
+
+    StaticJsonDocument<1024> doc;
+
+    JsonObject nodes = doc.createNestedObject("nodes");
+
+    float meanError = 0;
+    int cnt = 0;
+
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    {
+        Serial.printf("Node %s: err=%.6f, level=%s\n", dataNode[i].node_id, dataNode[i].error, dataNode[i].vibration_level);
+        doc[dataNode[i].node_id] = dataNode[i].error;
+    }
+
+    doc["vibration_level"] = highestLevel;
+    Serial.print("Overall Vibration Level: ");
+    Serial.println(highestLevel);
+    doc["sink_timestamp"] = millis();
+
+    String payload;
+    serializeJson(doc, payload);
+    bool ok = client.publish(mqtt_topic, payload.c_str());
+
+    if (ok)
+    {
+        Serial.println("MQTT publish successful!");
+    }
     else
-        return "SEVERE_SHAKING";
-}
-
-bool isValidEdgeNode(const uint8_t *mac)
-{
-    for (int i = 0; i < NUM_EDGE_NODES; i++)
     {
-        if (memcmp(mac, edgeMacs[i], 6) == 0)
-        {
-            return true;
-        }
+        Serial.println("MQTT publish FAILED!");
     }
-    return false;
 }
 
-bool isValidNodeId(const char *node_id)
-{
-    for (int i = 0; i < NUM_EDGE_NODES; i++)
-    {
-        if (strcmp(node_id, EXPECTED_NODES[i]) == 0)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
+// ===== ESP-NOW callback =====
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
     memcpy(&myData, data, sizeof(myData));
 
-    int nodeIndex = -1;
-    for (int i = 0; i < NUM_EDGE_NODES; i++)
+    int idx = findNodeIndex(myData.node_id);
+    if (idx < 0)
     {
-        if (strcmp(myData.node_id, EXPECTED_NODES[i]) == 0)
-        {
-            nodeIndex = i;
-            break;
-        }
-    }
-
-    if (nodeIndex == -1)
-    {
-        Serial.println("⚠ Unknown node ID, skipping");
+        Serial.println("Unknown node -> skipped");
         return;
     }
 
-    dataNode[nodeIndex] = myData;
-    nodeReceived[nodeIndex] = true;
+    dataNode[idx] = myData;
+    nodeReceived[idx] = true;
 
-    Serial.printf("Node %s received and stored!\n", myData.node_id);
+    Serial.printf("Node %s received!\n", myData.node_id);
 
     bool allOK = true;
     for (int i = 0; i < NUM_EDGE_NODES; i++)
-    {
         if (!nodeReceived[i])
             allOK = false;
-    }
 
     if (allOK)
     {
-        Serial.println("Received ALL NODES → Processing…");
-        float meanError = 0.0;
-        for (int i = 0; i < NUM_EDGE_NODES; i++)
-        {
-            if (strcmp(dataNode[i].node_id, "MPU_EDGE") == 0)
-            {
-                continue;
-            }
 
-            meanError += dataNode[i].error;
-        }
-        // meanError /= NUM_EDGE_NODES;
-
-        String vibrationLevel = classifyVibrationLevel(meanError);
-        send_to_thingsboard(vibrationLevel, meanError);
+        String highestLevel = getHighestVibrationLevel();
+        Serial.print("Highest Vibration Level: ");
+        Serial.println(highestLevel);
+        Serial.println("=== All nodes ready → publishing ===");
+        publishAllNodes(highestLevel);
+        memset(nodeReceived, 0, sizeof(nodeReceived));
     }
 }
 
-void addPeers()
+// ===== Add ESP-NOW peers =====
+void addPeers(int channel)
 {
-    Serial.println("\n[Peer] Adding 2 peers with assigned MAC addresses…");
-
-    esp_now_peer_info_t peer1{};
-    memcpy(peer1.peer_addr, edgeMacs[0], 6);
-    peer1.channel = WIFI_CHANNEL_LOCK;
-    peer1.encrypt = false;
-
-    Serial.print("  Peer 1 MAC: ");
-    printMac(edgeMacs[0]);
-    Serial.printf(" Channel: %d\n", peer1.channel);
-
-    esp_err_t st1 = esp_now_add_peer(&peer1);
-    if (st1 == ESP_OK)
+    for (int i = 0; i < NUM_EDGE_NODES; i++)
     {
-        Serial.println("     Peer 1 added");
-    }
-    else if (st1 == ESP_ERR_ESPNOW_EXIST)
-    {
-        Serial.println("     Peer 1 already existed");
-    }
-    else
-    {
-        Serial.print("     Peer 1 add failed: ");
-        Serial.println(st1);
-    }
+        esp_now_peer_info_t peer{};
+        memcpy(peer.peer_addr, edgeMacs[i], 6);
+        peer.channel = channel;
+        peer.encrypt = false;
 
-    esp_now_peer_info_t peer2{};
-    memcpy(peer2.peer_addr, edgeMacs[1], 6);
-    peer2.channel = WIFI_CHANNEL_LOCK;
-    peer2.encrypt = false;
+        esp_err_t st = esp_now_add_peer(&peer);
 
-    Serial.print("  Peer 2 MAC: ");
-    printMac(edgeMacs[1]);
-    Serial.printf(" Channel: %d\n", peer2.channel);
+        Serial.print("Peer: ");
+        printMac(edgeMacs[i]);
+        Serial.printf(" CH=%d ", channel);
 
-    esp_err_t st2 = esp_now_add_peer(&peer2);
-    if (st2 == ESP_OK)
-    {
-        Serial.println("     Peer 2 added");
-    }
-    else if (st2 == ESP_ERR_ESPNOW_EXIST)
-    {
-        Serial.println("    Peer 2 already existed");
-    }
-    else
-    {
-        Serial.print("     Peer 2 add failed: ");
-        Serial.println(st2);
+        if (st == ESP_OK)
+            Serial.println("→ added");
+        else if (st == ESP_ERR_ESPNOW_EXIST)
+            Serial.println("→ exists");
+        else
+            Serial.printf("→ FAILED %d\n", st);
     }
 }
 
+// ===== WiFi setup =====
 void setup_wifi()
 {
-    delay(10);
-    Serial.println("\n===== SINK NODE START =====");
-
     WiFi.mode(WIFI_STA);
-
-    Serial.print("[WiFi] This ESP MAC: ");
-    Serial.println(WiFi.macAddress());
-
-    Serial.print("[WiFi] Connecting to: ");
-    Serial.println(ssid);
-    WiFi.disconnect(true);
-    delay(100);
-
-    WiFi.mode(WIFI_STA);
-    // WiFi.config(
-    //     IPAddress(192, 168, 0, 149),
-    //     IPAddress(192, 168, 0, 1),
-    //     IPAddress(255, 255, 255, 0),
-    //     IPAddress(8, 8, 8, 8));
     WiFi.begin(ssid, password);
+
+    Serial.println("Connecting WiFi...");
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 30)
@@ -232,62 +198,35 @@ void setup_wifi()
 
     if (WiFi.status() == WL_CONNECTED)
     {
-        Serial.println("\n[WiFi] Connected!");
-        Serial.print("[WiFi] IP address: ");
+        Serial.println("\nWiFi connected!");
+        Serial.print("IP: ");
         Serial.println(WiFi.localIP());
-        Serial.print("[WiFi] Channel: ");
-        Serial.println(WiFi.channel());
-        Serial.println(WiFi.localIP());
-        Serial.println(WiFi.gatewayIP());
-        Serial.println(WiFi.dnsIP());
     }
     else
     {
-        Serial.println("\n[WiFi] Connection failed!");
-        Serial.print("[WiFi] Status: ");
-        Serial.println(WiFi.status());
-        Serial.println("[WiFi] ESP-NOW will still work, but MQTT won't");
+        Serial.println("\nWiFi FAILED!");
     }
 
     int channel = WiFi.channel();
-
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-    Serial.print("[WiFi] Channel locked to: ");
-    Serial.println(channel);
 
-    Serial.print("[ESPNOW] Initializing… ");
     if (esp_now_init() != ESP_OK)
     {
-        Serial.println("❌ FAIL");
+        Serial.println("ESP-NOW INIT FAIL");
         while (1)
             delay(1000);
     }
-    Serial.println("OK");
 
     esp_now_register_recv_cb(onDataRecv);
-
-    addPeers();
-    Serial.println("===== Sink ready. Waiting for packets from 2 Edge Nodes… =====");
+    addPeers(channel);
 }
 
+// ===== MQTT reconnect =====
 void reconnect_mqtt()
 {
-    IPAddress testIP;
-    if (!WiFi.hostByName("mqtt.eu.thingsboard.cloud", testIP))
-    {
-        Serial.println("DNS FAIL - cannot resolve hostname!");
-    }
-    else
-    {
-        Serial.print("Resolved: ");
-        Serial.println(testIP);
-    }
-
     while (!client.connected())
     {
-        Serial.print("Attempt MQTT connect...");
-        String clientId = "ESP32-Sink-";
-        clientId += String(random(0xffff), HEX);
+        String clientId = "ESP32Sink-" + String(random(0xffff), HEX);
         if (client.connect(clientId.c_str(), access_token, NULL))
         {
             Serial.println("MQTT connected");
@@ -296,62 +235,45 @@ void reconnect_mqtt()
         {
             Serial.print("MQTT fail rc=");
             Serial.println(client.state());
-            delay(5000);
+            delay(3000);
         }
     }
 }
 
-void send_to_thingsboard(String vibrationLevel, float meanError)
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        Serial.println("WiFi not connected. Skip send");
-        return;
-    }
-    if (!client.connected())
-        reconnect_mqtt();
-    StaticJsonDocument<256> doc;
-    doc["node_id"] = "SINK_NODE";
-    doc["mean_error"] = meanError;
-    doc["vibration_level"] = vibrationLevel;
-    doc["timestamp"] = millis();
-    String payload;
-    serializeJson(doc, payload);
-    Serial.println("Publish payload:");
-    Serial.println(payload);
-    if (client.publish(mqtt_topic, payload.c_str()))
-    {
-        Serial.println("Published OK");
-    }
-    else
-    {
-        Serial.println("Publish FAIL");
-    }
-    for (int i = 0; i < NUM_EDGE_NODES; i++)
-        nodeReceived[i] = false;
-    for (int i = 0; i < NUM_EDGE_NODES; i++)
-        memset(&dataNode[i], 0, sizeof(struct_message));
-}
-
+// ===== Setup =====
 void setup()
 {
     Serial.begin(115200);
-    delay(200);
-    Serial.println("Sink Node starting");
+    delay(300);
 
     setup_wifi();
-
     client.setServer(mqtt_server, mqtt_port);
-
     reconnect_mqtt();
-
-    Serial.println("Sink ready. Waiting for incoming ESP-NOW packets");
 }
 
+// ===== Loop =====
 void loop()
 {
-    if (!client.connected())
-        reconnect_mqtt();
     client.loop();
-    delay(10);
 }
+
+// ===== ESP-NOW callback =====
+// void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
+// {
+//     struct_message msg;
+//     memcpy(&msg, data, sizeof(msg));
+
+//     // Đẩy vào queue nếu còn chỗ
+//     int nextTail = (queueTail + 1) % QUEUE_SIZE;
+//     if (nextTail != queueHead)
+//     {
+//         publishQueue[queueTail] = msg;
+//         queueTail = nextTail;
+//         Serial.printf("[RECV] Node: %s | err=%.4f | rms=%.4f\n",
+//                       msg.node_id, msg.error, msg.computed_rms);
+//     }
+//     else
+//     {
+//         Serial.println("[WARN] Publish queue full, dropping packet");
+//     }
+// }

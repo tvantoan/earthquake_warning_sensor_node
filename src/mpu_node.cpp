@@ -1,10 +1,15 @@
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Wire.h>
 #include <MPU6050.h>
-#include <rms_model_int8.h>
+#include <rms_mpu_model_int8.h>
 #include <math.h>
+#include "FS.h"
+#include "SPIFFS.h"
+
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -23,6 +28,7 @@ typedef struct
   float computed_rms;
   float predicted_rms;
   float error;
+  char vibration_level[20];
 } struct_message;
 
 struct_message myData;
@@ -31,7 +37,7 @@ constexpr int DYN_SAMPLE_HZ = 10;
 constexpr int DYN_WINDOW_SIZE = 100;
 constexpr int RMS_WINDOW_SIZE = DYN_WINDOW_SIZE / DYN_SAMPLE_HZ;
 constexpr int BATCH_PRINT = 10;
-
+int cnt = 0;
 double sumDynSq = 0.0;
 float gx = 0, gy = 0, gz = 0;
 bool gravityInit = false;
@@ -41,15 +47,32 @@ int dynIdx = 0, dynCnt = 0, rmsIdx = 0, rmsCnt = 0, batchCount = 0;
 static float ALPHA_GRAV = 0.96f;
 const float ACCEL_SCALE = 16384.0f;
 
-constexpr float MEAN_X[RMS_WINDOW_SIZE] = {0.048191f, 0.048178f, 0.048164f, 0.048153f, 0.048146f, 0.048139f, 0.048133f, 0.048127f, 0.048115f, 0.048102f};
-constexpr float SCALE_X[RMS_WINDOW_SIZE] = {0.003210f, 0.003203f, 0.003193f, 0.003188f, 0.003185f, 0.003181f, 0.003178f, 0.003177f, 0.003174f, 0.003175f};
-constexpr float MEAN_Y = 0.048090f;
-constexpr float SCALE_Y = 0.003176f;
+constexpr float MEAN_X[RMS_WINDOW_SIZE] = {0.006153f, 0.006153f, 0.006152f, 0.006152f, 0.006152f, 0.006151f, 0.006151f, 0.006151f, 0.006151f, 0.006152f};
+constexpr float SCALE_X[RMS_WINDOW_SIZE] = {0.000283f, 0.000283f, 0.000283f, 0.000283f, 0.000284f, 0.000284f, 0.000284f, 0.000284f, 0.000284f, 0.000284f};
+constexpr float MEAN_Y = 0.006152f;
+constexpr float SCALE_Y = 0.000283f;
 
 uint8_t tensor_arena[20 * 1024];
 tflite::MicroInterpreter *interpreter;
 TfLiteTensor *input;
 TfLiteTensor *output;
+
+String classifyVibrationLevel(float error)
+{
+  if (error < 0.00087304f)
+    return "NONE_SHAKING";
+  else if (error < 0.020f) // 2
+    return "MICRO_SHAKING";
+  else if (error < 0.052f) // 3
+    return "MINOR_SHAKING";
+  else if (error < 0.130f) // 4
+    return "LIGHT_SHAKING";
+  else if (error < 0.21f) // 5
+    return "MODERATE_SHAKING";
+  else
+    return "SEVERE_SHAKING"; //>6
+}
+
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
   Serial.print("onDataSent -> status: ");
@@ -97,8 +120,11 @@ void feedModel(float currentRms)
   myData.computed_rms = currentRms;
   myData.predicted_rms = out_real;
   myData.error = error;
-
+  strcpy(myData.vibration_level, classifyVibrationLevel(error).c_str());
+  // Serial.println(error, 6);
   Serial.printf("RMS=%.6f | Pred=%.6f | Err=%.6f\n", currentRms, out_real, error);
+  Serial.print("Vibration Level: ");
+  Serial.println(myData.vibration_level);
 
   esp_err_t result = esp_now_send(sinkMac, (uint8_t *)&myData, sizeof(myData));
   Serial.print("esp_now_send result: ");
@@ -114,10 +140,15 @@ void setup()
   mpu.initialize();
   mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
   mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("SPIFFS Error");
+  }
+
   static tflite::MicroErrorReporter micro_error_reporter;
   static tflite::AllOpsResolver resolver;
   static tflite::MicroInterpreter static_interpreter(
-      tflite::GetModel(rms_model_int8_tflite), resolver,
+      tflite::GetModel(rms_mpu_model_int8_tflite), resolver,
       tensor_arena, sizeof(tensor_arena), &micro_error_reporter);
 
   interpreter = &static_interpreter;
@@ -197,6 +228,19 @@ void loop()
   {
     batchCount = 0;
     float rms = sqrt(sumDynSq / dynCnt);
+    // Serial.println(rms, 6);
+    // Serial.println(rms, 6);
+    // cnt++;
+
+    // ghi vào file:
+    // File f = SPIFFS.open("/log.txt", FILE_APPEND);
+    // if (f)
+    // {
+    //   f.print(rms, 6);
+    //   f.print("\n");
+    //   f.close();
+    // }
+
     rmsBuf[rmsIdx] = rms;
 
     if (rmsCnt < RMS_WINDOW_SIZE)

@@ -79,7 +79,7 @@ void setup()
     Serial.println("Không còn file nào trên SPIFFS.");
   }
 
-  Serial.println("=== SPIFFS sạch rồi nè anh ===");
+  Serial.println("=== SPIFFS sạch rồi ===");
 }
 
 void loop() {}
